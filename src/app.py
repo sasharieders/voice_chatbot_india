@@ -7,14 +7,16 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 import os
-
-# Add project root to path for imports
 import sys
 from pathlib import Path
+
+# Add project root to path for imports
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.use_cases.test_screening import TestScreeningUseCase
+from src.voice.twilio_handler import TwilioVoiceHandler
+from twilio.twiml.voice_response import VoiceResponse
 
 # Load environment variables
 load_dotenv()
@@ -23,11 +25,13 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# Initialize use cases
+# Initialize use cases and handlers
 test_screening = TestScreeningUseCase()
+twilio_voice = TwilioVoiceHandler()
 
 # In-memory context storage (for demo - use database in production)
 user_contexts = {}
+call_contexts = {}  # Track context per call
 
 
 @app.route('/health', methods=['GET'])
@@ -105,6 +109,159 @@ def chat():
         }), 500
 
 
+# ============================================================================
+# VOICE ENDPOINTS (Twilio Webhooks)
+# ============================================================================
+
+@app.route('/voice/incoming', methods=['POST', 'GET'])
+def voice_incoming():
+    """
+    Handle incoming Twilio voice calls.
+    This is the entry point when someone calls your Twilio number.
+    """
+    try:
+        language = request.values.get('language', 'english')
+        call_sid = request.values.get('CallSid', 'unknown')
+        
+        # Initialize context for this call
+        call_contexts[call_sid] = {
+            'pregnancy_week': None,  # Will ask user or default to 20
+            'language': language,
+            'name': 'there',
+            'messages': []
+        }
+        
+        app.logger.info(f"Incoming call: {call_sid}, language: {language}")
+        
+        return twilio_voice.welcome_message(language), 200, {'Content-Type': 'text/xml'}
+        
+    except Exception as e:
+        app.logger.error(f"Error in /voice/incoming: {str(e)}")
+        return twilio_voice.handle_error(str(e)), 200, {'Content-Type': 'text/xml'}
+
+
+@app.route('/voice/process', methods=['POST'])
+def voice_process():
+    """
+    Process speech input from user.
+    Called after user speaks in response to prompts.
+    """
+    try:
+        speech_result = request.values.get('SpeechResult', '')
+        confidence = float(request.values.get('Confidence', 0))
+        call_sid = request.values.get('CallSid', 'unknown')
+        
+        app.logger.info(f"Speech received: '{speech_result}' (confidence: {confidence})")
+        
+        # Get or create context for this call
+        if call_sid not in call_contexts:
+            call_contexts[call_sid] = {
+                'pregnancy_week': 20,  # Default
+                'language': 'english',
+                'name': 'there',
+                'messages': []
+            }
+        
+        context = call_contexts[call_sid]
+        language = context['language']
+        
+        if not speech_result or confidence < 0.5:
+            # Low confidence or no speech
+            return twilio_voice._ask_to_repeat(language), 200, {'Content-Type': 'text/xml'}
+        
+        # Add to conversation history
+        context['messages'].append({
+            'role': 'user',
+            'content': speech_result
+        })
+        
+        # Get chatbot response using test screening use case
+        chatbot_response = test_screening.handle(speech_result, context)
+        
+        # Add to conversation history
+        context['messages'].append({
+            'role': 'assistant',
+            'content': chatbot_response
+        })
+        
+        app.logger.info(f"Chatbot response: {chatbot_response[:100]}...")
+        
+        return twilio_voice.generate_response(chatbot_response, language), 200, {'Content-Type': 'text/xml'}
+        
+    except Exception as e:
+        app.logger.error(f"Error in /voice/process: {str(e)}")
+        language = call_contexts.get(call_sid, {}).get('language', 'english')
+        return twilio_voice.handle_error(str(e), language), 200, {'Content-Type': 'text/xml'}
+
+
+@app.route('/voice/language', methods=['POST', 'GET'])
+def voice_language():
+    """
+    Language selection menu.
+    Allows user to choose between English and Hindi.
+    """
+    try:
+        return twilio_voice.language_selection(), 200, {'Content-Type': 'text/xml'}
+    except Exception as e:
+        app.logger.error(f"Error in /voice/language: {str(e)}")
+        return twilio_voice.handle_error(str(e)), 200, {'Content-Type': 'text/xml'}
+
+
+@app.route('/voice/set-language', methods=['POST'])
+def voice_set_language():
+    """
+    Set language based on keypad input.
+    Called after user presses 1 (English) or 2 (Hindi).
+    """
+    try:
+        digits = request.values.get('Digits', '1')
+        call_sid = request.values.get('CallSid', 'unknown')
+        language = 'hindi' if digits == '2' else 'english'
+        
+        # Update call context
+        if call_sid in call_contexts:
+            call_contexts[call_sid]['language'] = language
+        
+        app.logger.info(f"Language set to: {language} for call {call_sid}")
+        
+        response = VoiceResponse()
+        response.redirect(f'/voice/incoming?language={language}')
+        return str(response), 200, {'Content-Type': 'text/xml'}
+        
+    except Exception as e:
+        app.logger.error(f"Error in /voice/set-language: {str(e)}")
+        return twilio_voice.handle_error(str(e)), 200, {'Content-Type': 'text/xml'}
+
+
+@app.route('/voice/continue', methods=['POST'])
+def voice_continue():
+    """
+    Continue conversation flow.
+    """
+    try:
+        call_sid = request.values.get('CallSid', 'unknown')
+        context = call_contexts.get(call_sid, {'language': 'english'})
+        language = context['language']
+        
+        # For now, just end the call gracefully
+        response = VoiceResponse()
+        if language == 'hindi':
+            response.say("धन्यवाद। अलविदा।", language='hi-IN')
+        else:
+            response.say("Thank you for calling. Goodbye!", language='en-IN')
+        response.hangup()
+        
+        return str(response), 200, {'Content-Type': 'text/xml'}
+        
+    except Exception as e:
+        app.logger.error(f"Error in /voice/continue: {str(e)}")
+        return twilio_voice.handle_error(str(e)), 200, {'Content-Type': 'text/xml'}
+
+
+# ============================================================================
+# CONTEXT MANAGEMENT ENDPOINTS
+# ============================================================================
+
 @app.route('/api/context', methods=['GET', 'POST'])
 def manage_context():
     """
@@ -153,40 +310,10 @@ def reset_context():
     })
 
 
-@app.route('/voice/incoming', methods=['POST'])
-def incoming_call():
-    """
-    Handle incoming Twilio voice calls.
-    This is a placeholder for voice integration.
-    """
-    # TODO: Implement Twilio voice handling
-    from twilio.twiml.voice_response import VoiceResponse
-    
-    response = VoiceResponse()
-    response.say(
-        "Welcome to maternal health support. This feature is coming soon.",
-        language='en-IN'
-    )
-    
-    return str(response), 200, {'Content-Type': 'text/xml'}
+# ============================================================================
+# DEVELOPMENT HELPER ENDPOINTS
+# ============================================================================
 
-
-@app.route('/voice/gather', methods=['POST'])
-def gather_input():
-    """
-    Handle user voice input from Twilio.
-    This is a placeholder for voice integration.
-    """
-    # TODO: Implement speech gathering
-    from twilio.twiml.voice_response import VoiceResponse
-    
-    response = VoiceResponse()
-    response.say("Voice input handling coming soon.", language='en-IN')
-    
-    return str(response), 200, {'Content-Type': 'text/xml'}
-
-
-# Development helper endpoints
 @app.route('/api/test', methods=['GET'])
 def test_endpoint():
     """Quick test endpoint to verify API is working."""
@@ -196,6 +323,8 @@ def test_endpoint():
             'health': '/health',
             'chat': '/api/chat (POST)',
             'context': '/api/context (GET/POST)',
+            'voice_incoming': '/voice/incoming (POST)',
+            'voice_process': '/voice/process (POST)',
             'test': '/api/test (GET)'
         }
     })
@@ -237,20 +366,6 @@ def examples():
                     'language': 'hindi',
                     'name': 'प्रिया'
                 }
-            },
-            {
-                'description': 'Get user context',
-                'endpoint': '/api/context?user_id=user123',
-                'method': 'GET'
-            },
-            {
-                'description': 'Update user context',
-                'endpoint': '/api/context?user_id=user123',
-                'method': 'POST',
-                'body': {
-                    'pregnancy_week': 25,
-                    'language': 'hindi'
-                }
             }
         ]
     })
@@ -266,13 +381,17 @@ if __name__ == '__main__':
     ║                                                        ║
     ║   Server starting on http://localhost:{port}            ║
     ║                                                        ║
-    ║   Endpoints:                                           ║
+    ║   API Endpoints:                                       ║
     ║   • GET  /health           - Health check              ║
-    ║   • POST /api/chat         - Main chat endpoint        ║
-    ║   • GET  /api/examples     - See example requests      ║
-    ║   • GET  /api/test         - Quick API test            ║
+    ║   • POST /api/chat         - Text chat                 ║
+    ║   • GET  /api/examples     - Example requests          ║
     ║                                                        ║
-    ║   Try: curl http://localhost:{port}/api/test            ║
+    ║   Voice Endpoints (Twilio):                            ║
+    ║   • POST /voice/incoming   - Incoming calls            ║
+    ║   • POST /voice/process    - Process speech            ║
+    ║   • POST /voice/language   - Language selection        ║
+    ║                                                        ║
+    ║   Next: Set up ngrok and configure Twilio webhook     ║
     ╚════════════════════════════════════════════════════════╝
     """)
     
